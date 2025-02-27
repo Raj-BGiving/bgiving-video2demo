@@ -1,0 +1,160 @@
+name: Build, Push to ECR and Deploy to ECS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: video2docs-server
+  IMAGE_TAG: latest
+  COMMIT_HASH: ${{ github.sha }}
+  ECS_CLUSTER: video2docs-server-cluster     
+  ECS_SERVICE: video2docs-server-service
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image-uri: ${{ steps.build-image.outputs.image-uri }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build and push image to ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      run: |
+        # Build with both latest and commit hash tags
+        echo "Building image..."
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:${COMMIT_HASH:0:7}
+        
+        echo "Pushing images..."
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:${COMMIT_HASH:0:7}
+        
+        # Verify the push
+        echo "Verifying image push..."
+        aws ecr describe-images \
+          --repository-name $ECR_REPOSITORY \
+          --image-ids imageTag=$IMAGE_TAG || exit 1
+        
+        echo "image-uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Cleanup old images
+      run: |
+        # Keeping the 3 most recent images by pushing date
+        IMAGES_TO_DELETE=$(aws ecr describe-images \
+          --repository-name $ECR_REPOSITORY \
+          --query 'reverse(sort_by(imageDetails,& imagePushedAt))[3:].imageDigest' \
+          --output text)
+        
+        if [ ! -z "$IMAGES_TO_DELETE" ]; then
+          echo "Deleting old images..."
+          for digest in $IMAGES_TO_DELETE; do
+            aws ecr batch-delete-image \
+              --repository-name $ECR_REPOSITORY \
+              --image-ids imageDigest=$digest
+          done
+        else
+          echo "No old images to delete"
+        fi
+
+        
+
+  deploy-to-ecs:
+    name: Deploy to ECS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Verify image exists before deployment
+      run: |
+        echo "Verifying image exists in ECR..."
+        aws ecr describe-images \
+          --repository-name $ECR_REPOSITORY \
+          --image-ids imageTag=$IMAGE_TAG || exit 1
+
+    - name: Force New ECS Deployment
+      run: |
+        echo "Starting new deployment..."
+        aws ecs update-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service ${{ env.ECS_SERVICE }} \
+          --force-new-deployment
+
+    - name: Wait for service stability
+      run: |
+        echo "Waiting for service to stabilize..."
+        timeout 900 aws ecs wait services-stable \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }}
+        
+        if [ $? -eq 124 ]; then
+          echo "::error::Deployment timed out after 15 minutes"
+          # Get deployment status
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].{deployments:deployments,events:events[0:5]}'
+          exit 1
+        fi
+
+    - name: Verify deployment
+      if: success()
+      run: |
+        echo "Verifying deployment..."
+        # Check service status
+        aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }} \
+          --query 'services[0].{runningCount:runningCount,desiredCount:desiredCount,status:status}'
+
+    - name: Debug on failure
+      if: failure()
+      run: |
+        echo "::group::Service Status"
+        aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service ${{ env.ECS_SERVICE }} \
+          --query 'services[0].{deployments:deployments,events:events[0:5]}'
+        echo "::endgroup::"
+        
+        echo "::group::Recent Tasks"
+        TASKS=$(aws ecs list-tasks \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service-name ${{ env.ECS_SERVICE }} \
+          --desired-status STOPPED \
+          --query 'taskArns[]' \
+          --output text)
+        
+        if [ ! -z "$TASKS" ]; then
+          aws ecs describe-tasks \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --tasks $TASKS
+        fi
+        echo "::endgroup::"
